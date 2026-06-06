@@ -1,0 +1,69 @@
+﻿Assignment 04 - Website Automation Agent 
+Assignment Overview 
+Create an intelligent website automation agent capable of interacting with web pages 
+autonomously. This project serves as a mini-version of browser automation tools like Browser 
+Use, demonstrating your understanding of AI-driven browser control and web automation. 
+Project Objective 
+Build an automation agent that can navigate to a specific URL, interact with web elements, and 
+perform form-filling operations without manual intervention. Your agent should demonstrate 
+intelligent decision-making in identifying and manipulating web page elements. 
+Target Task 
+Your automation agent must perform the following task: 
+ΓùÅΓÇï Navigate to: https://ui.shadcn.com/docs/forms/react-hook-form 
+ΓùÅΓÇï Identify the form elements on the page (Name and Description fields) 
+ΓùÅΓÇï Automatically fill in the Name and Description 
+Technical Requirements 
+Required Tools & Technologies 
+Browser Automation Library (Choose one): 
+ΓùÅΓÇï Playwright (Recommended) 
+ΓùÅΓÇï Puppeteer 
+Programming Language: 
+ΓùÅΓÇï Any language of your choice (JavaScript/TypeScript, Python, Java, etc.) 
+Core Functionalities to Implement 
+Your agent must include the following tools/capabilities: 
+ΓùÅΓÇï take_screenshot - Capture the current state of the browser window 
+ΓùÅΓÇï open_browser - Initialize and launch a browser instance 
+ΓùÅΓÇï navigate_to_url - Direct the browser to a specific URL 
+ΓùÅΓÇï click_on_screen(x, y) - Perform mouse clicks at specified coordinates 
+ΓùÅΓÇï send_keys - Input text into form fields or text areas 
+ΓùÅΓÇï scroll - Scroll the page to reveal hidden elements 
+ΓùÅΓÇï double_click - Perform double-click actions when necessary 
+ 
+ 
+ 
+ 
+ 
+
+Implementation Guidelines 
+ΓùÅΓÇï Agent Architecture: Design your agent with modular tools that can be composed 
+together 
+ΓùÅΓÇï Element Detection: Implement intelligent element identification using selectors, XPath, 
+or visual recognition 
+ΓùÅΓÇï Error Handling: Include proper error handling for network issues, element not found, 
+and timeout scenarios 
+ΓùÅΓÇï Logging: Implement comprehensive logging to track agent actions and decisions 
+ΓùÅΓÇï Configuration: Use environment variables or configuration files for API keys and 
+settings 
+Project Deliverables 
+ΓùÅΓÇï Source Code: Complete, well-documented codebase with clear comments 
+ΓùÅΓÇï README File: Include setup instructions, dependencies, and how to run the agent 
+ΓùÅΓÇï Architecture Document: Brief explanation of your design decisions and agent workflow 
+Evaluation Criteria 
+Your project will be evaluated during your viva based on: 
+ΓùÅΓÇï Functionality (40%): Does the agent successfully complete the target task? 
+ΓùÅΓÇï Code Quality (25%): Is the code clean, modular, and well-documented? 
+ΓùÅΓÇï Agent Intelligence (20%): How well does the agent handle element detection and 
+decision-making? 
+ΓùÅΓÇï Error Handling (10%): Robustness in handling edge cases and failures 
+ΓùÅΓÇï Documentation (5%): Quality of README and inline code comments 
+ 
+Submission Guidelines 
+ΓùÅΓÇï Deadline: No fixed deadline ΓÇö evaluation will occur during your viva voce examination 
+ΓùÅΓÇï Presentation: Be prepared to demonstrate your agent live during the viva 
+Helpful Resources 
+ΓùÅΓÇï Playwright Documentation: https://playwright.dev/ 
+ΓùÅΓÇï Puppeteer Documentation: https://pptr.dev/ 
+ΓùÅΓÇï Browser Use (Reference): https://github.com/browser-use/browser-use 
+ΓùÅΓÇï OpenAI Agents SDK: https://openai.github.io/openai-agents-js 
+ 
+
