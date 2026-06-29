@@ -25,12 +25,22 @@ import os
 import sys
 from dotenv import load_dotenv
 
+# Windows consoles default to cp1252, which can't encode emoji / non-Latin text
+# that appears in logs and the JSON report. Switch stdout/stderr to UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # Load environment variables from .env file BEFORE importing agent modules
 load_dotenv()
 
+import json
+
 from agent.logger import get_logger
 from agent.browser_tools import open_browser
-from agent.agent_loop import run_rule_based_agent, run_ai_agent
+from agent.agent_loop import run_rule_based_agent, run_ai_agent, execute_task
 
 logger = get_logger("main")
 
@@ -51,9 +61,12 @@ Examples:
 
     parser.add_argument(
         "--mode",
-        choices=["rule", "ai"],
+        choices=["rule", "ai", "auto"],
         default=os.getenv("AGENT_MODE", "rule"),
-        help="Agent mode: 'rule' (deterministic) or 'ai' (Gemini Vision). Default: rule",
+        help=(
+            "Agent mode: 'rule' (deterministic form-fill), 'ai' (vision form-fill), "
+            "or 'auto' (generic instruction-driven, any URL + any task). Default: rule"
+        ),
     )
     parser.add_argument(
         "--url",
@@ -75,6 +88,18 @@ Examples:
             "This is an automated form submission by my AI agent.",
         ),
         help="Value to fill in the Description/Bio field",
+    )
+    parser.add_argument(
+        "--instruction",
+        default=os.getenv("INSTRUCTION", ""),
+        help="Plain-English task for 'auto' mode (e.g. 'search for X and open the first result')",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=int(os.getenv("MAX_STEPS", "15")),
+        dest="max_steps",
+        help="Max reasoning iterations for 'auto' mode (default: 15)",
     )
     parser.add_argument(
         "--headless",
@@ -106,6 +131,23 @@ async def main() -> None:
     logger.info("║  Name     : %-32s║", args.name[:32])
     logger.info("║  Headless : %-32s║", str(args.headless))
     logger.info("╚══════════════════════════════════════════════╝")
+
+    # ── Auto mode: generic instruction agent owns its own browser ─────
+    if args.mode == "auto":
+        instruction = args.instruction
+        if not instruction:
+            logger.error("--instruction is required for 'auto' mode.")
+            sys.exit(2)
+        report = await execute_task(
+            url=args.url,
+            instruction=instruction,
+            headless=args.headless,
+            slow_mo=args.slow_mo,
+            max_steps=args.max_steps,
+        )
+        logger.info("Status: %s — %s", report["status"], report["summary"])
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        sys.exit(0 if report["status"] == "success" else 1)
 
     playwright = None
     browser = None

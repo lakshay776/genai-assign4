@@ -29,6 +29,7 @@ from playwright.async_api import Page
 from agent.logger import get_logger
 from agent.browser_tools import (
     DEFAULT_TIMEOUT,
+    open_browser,
     navigate_to_url,
     take_screenshot,
     send_keys,
@@ -36,6 +37,9 @@ from agent.browser_tools import (
     click_element,
     click_on_screen,
     double_click,
+    press_key,
+    get_text,
+    list_interactables,
 )
 
 logger = get_logger("agent_loop")
@@ -443,3 +447,400 @@ Rules:
             "⚠️  AI agent reached max steps (%d) without signalling completion.",
             MAX_STEPS,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODE C — Generic Instruction-Driven Agent (any URL + any instruction)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This is the engine behind the web frontend. Unlike the two modes above —
+# which are hardwired to fill a name/description form — this agent takes a
+# free-text instruction (e.g. "search for 'playwright' and open the first
+# result") and a target URL, then drives the browser with a Groq vision
+# model until the instruction is satisfied. It returns a structured *report*
+# (steps, screenshots, extracted text, status) that the UI can render.
+# ─────────────────────────────────────────────────────────────────────────────
+
+GENERIC_SYSTEM_PROMPT = """You are an autonomous web-automation agent controlling a real Chromium browser.
+
+You are given a TASK written in plain English and a screenshot of the current page.
+At each step you decide the SINGLE next action that makes progress toward the task.
+
+Respond with ONLY a JSON object (no markdown, no prose) of this shape:
+  {"thought": "<one short sentence of reasoning>", "action": "<action>", ...params}
+
+Available actions and their params:
+  {"thought": "...", "action": "scroll", "direction": "down|up", "amount": 400}
+  {"thought": "...", "action": "click", "selector": "<css or text= selector>"}
+  {"thought": "...", "action": "fill", "selector": "<css selector>", "text": "<value>"}
+  {"thought": "...", "action": "press_key", "key": "Enter"}
+  {"thought": "...", "action": "extract", "selector": "<css selector>"}
+  {"thought": "...", "action": "wait", "ms": 1000}
+  {"thought": "...", "action": "screenshot", "label": "<label>"}
+  {"thought": "...", "action": "done", "success": true, "summary": "<what you accomplished>"}
+
+Selector guidance:
+  - You will be given a list of INTERACTABLE ELEMENTS with their EXACT selectors.
+    ALWAYS pick a selector from that list when one fits — do NOT invent selectors
+    or guess attribute names that aren't shown there.
+  - If nothing in the list fits, fall back to simple selectors:
+      Text-based: "text=Sign in"  (a clickable element containing that text)
+      Generic:    "input", "textarea", "button[type='submit']"
+  - If a selector fails, choose a DIFFERENT one from the list next time — never
+    repeat a selector that just failed.
+
+Rules:
+  - Do EXACTLY what the task asks — nothing more.
+  - If the relevant element is not visible, scroll to find it before interacting.
+  - After filling a search/login box, either click its submit button or press_key "Enter".
+  - Use "extract" to capture any result/confirmation text the task is asking for.
+  - When the task is fully done, respond with action "done" and a clear summary.
+  - If you get stuck or the task is impossible, respond with action "done", "success": false,
+    and explain why in the summary.
+  - Output ONLY valid JSON. One action per response."""
+
+
+async def run_instruction_agent(
+    page: Page,
+    url: str,
+    instruction: str,
+    max_steps: int = 15,
+    screenshot_dir: Optional[Path] = None,
+    on_step=None,
+) -> dict:
+    """
+    Drive the browser to satisfy a free-text instruction on any URL.
+
+    Implements a ReAct loop (Reason → Act → Observe) using a Groq vision
+    model, and builds a structured report as it goes.
+
+    Args:
+        page:           Active Playwright Page.
+        url:            Target URL to start from.
+        instruction:    Plain-English task, e.g. "search for cats and open
+                        the first image".
+        max_steps:      Safety cap on the number of reasoning iterations.
+        screenshot_dir: Directory to save this run's screenshots into.
+        on_step:        Optional callback(step_dict) invoked after each step,
+                        for live progress streaming.
+
+    Returns:
+        A report dict:
+        {
+          "url": str, "instruction": str,
+          "status": "success" | "failed" | "incomplete" | "error",
+          "summary": str,
+          "model": str,
+          "steps": [ {step, thought, action, detail, screenshot, observation, error}, ... ],
+          "extracted": [str, ...],
+          "screenshots": [str, ...],
+        }
+    """
+    from openai import AsyncOpenAI
+
+    report: dict = {
+        "url": url,
+        "instruction": instruction,
+        "status": "incomplete",
+        "summary": "",
+        "model": _get_env("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
+        "steps": [],
+        "extracted": [],
+        "screenshots": [],
+    }
+
+    def _record(step: dict) -> None:
+        report["steps"].append(step)
+        if step.get("screenshot"):
+            report["screenshots"].append(step["screenshot"])
+        if on_step:
+            try:
+                on_step(step)
+            except Exception:  # never let the UI callback break the run
+                pass
+
+    api_key = _get_env("GROQ_API_KEY")
+    if not api_key:
+        report["status"] = "error"
+        report["summary"] = "GROQ_API_KEY is not set in the environment (.env)."
+        logger.error(report["summary"])
+        return report
+
+    client = AsyncOpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+    model_name = report["model"]
+
+    logger.info("=" * 60)
+    logger.info("AGENT MODE: Generic Instruction-Driven (Groq Vision)")
+    logger.info("Task: %s", instruction)
+    logger.info("URL : %s", url)
+    logger.info("=" * 60)
+
+    # ── Navigate to the starting page ─────────────────────────────────
+    try:
+        await navigate_to_url(page, url)
+        await _wait(page, 1500)
+    except Exception as exc:
+        report["status"] = "error"
+        report["summary"] = f"Could not load the page: {exc}"
+        logger.error(report["summary"])
+        return report
+
+    system_prompt = GENERIC_SYSTEM_PROMPT
+
+    action_history: list = []
+    last_error = ""
+
+    for step_no in range(1, max_steps + 1):
+        logger.info("── Step %d/%d ──────────────────────", step_no, max_steps)
+
+        shot_path = await take_screenshot(
+            page, f"step_{step_no:02d}", directory=screenshot_dir
+        )
+        shot_rel = shot_path.name
+
+        with open(shot_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        # Give the model the REAL interactable elements on the page so it
+        # targets selectors that exist instead of guessing from the screenshot.
+        elements = await list_interactables(page, max_items=30)
+        if elements:
+            elem_lines = "\n".join(
+                f'  - {e["selector"]}'
+                + (f'  ({e["tag"]}'
+                   + (f' type={e["type"]}' if e["type"] else "")
+                   + (f' "{e["label"]}"' if e["label"] else "")
+                   + ")")
+                for e in elements
+            )
+            elements_block = (
+                "\n\nINTERACTABLE ELEMENTS currently on the page "
+                "(use these EXACT selectors — do not invent your own):\n"
+                + elem_lines
+            )
+        else:
+            elements_block = ""
+
+        user_text = (
+            f"TASK: {instruction}\n\n"
+            f"You are on: {page.url}\n"
+            "Decide the next single action."
+            + elements_block
+        )
+        if action_history:
+            user_text += (
+                "\n\nActions you have already taken (do not pointlessly repeat them):\n"
+                + json.dumps(action_history, indent=2)
+            )
+        if last_error:
+            user_text += (
+                f"\n\nYour previous action FAILED: {last_error}\n"
+                "Try a different, simpler selector or a different approach."
+            )
+            last_error = ""
+
+        raw_text = ""
+        try:
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{img_b64}"
+                                },
+                            },
+                            {"type": "text", "text": user_text},
+                        ],
+                    },
+                ],
+                max_tokens=400,
+                temperature=0.0,
+            )
+            raw_text = response.choices[0].message.content.strip()
+
+            if raw_text.startswith("```"):
+                raw_text = raw_text.split("```")[1]
+                if raw_text.startswith("json"):
+                    raw_text = raw_text[4:]
+            action_data = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            logger.error("❌ Bad JSON from model: %s | raw=%s", exc, raw_text)
+            _record({
+                "step": step_no,
+                "thought": "",
+                "action": "parse_error",
+                "detail": raw_text[:300],
+                "screenshot": shot_rel,
+                "observation": "",
+                "error": f"Could not parse model response: {exc}",
+            })
+            last_error = "Your last response was not valid JSON. Respond with ONLY a JSON object."
+            continue
+        except Exception as exc:
+            logger.error("❌ Groq API call failed: %s", exc)
+            report["status"] = "error"
+            report["summary"] = f"Model API call failed: {exc}"
+            _record({
+                "step": step_no,
+                "thought": "",
+                "action": "api_error",
+                "detail": "",
+                "screenshot": shot_rel,
+                "observation": "",
+                "error": str(exc),
+            })
+            return report
+
+        action = str(action_data.get("action", "")).lower()
+        thought = action_data.get("thought", "")
+        logger.info("🤖 thought: %s", thought)
+        logger.info("🤖 action: %s", action_data)
+        action_history.append({k: v for k, v in action_data.items() if k != "thought"})
+
+        step_entry = {
+            "step": step_no,
+            "thought": thought,
+            "action": action,
+            "detail": "",
+            "screenshot": shot_rel,
+            "observation": "",
+            "error": "",
+        }
+
+        # ── Execute the chosen action ─────────────────────────────────
+        try:
+            if action == "scroll":
+                direction = action_data.get("direction", "down")
+                amount = int(action_data.get("amount", 400))
+                step_entry["detail"] = f"{direction} {amount}px"
+                await scroll(page, direction=direction, amount=amount)
+
+            elif action == "click":
+                selector = action_data["selector"]
+                step_entry["detail"] = selector
+                await click_element(page, selector)
+
+            elif action == "fill":
+                selector = action_data["selector"]
+                text = action_data.get("text", "")
+                step_entry["detail"] = f"{selector} ← {text!r}"
+                await send_keys(page, selector, text)
+
+            elif action == "press_key":
+                key = action_data.get("key", "Enter")
+                step_entry["detail"] = key
+                await press_key(page, key)
+
+            elif action == "extract":
+                selector = action_data.get("selector", "body")
+                step_entry["detail"] = selector
+                text = await get_text(page, selector)
+                step_entry["observation"] = text
+                if text:
+                    report["extracted"].append(text)
+
+            elif action == "wait":
+                ms = int(action_data.get("ms", 1000))
+                step_entry["detail"] = f"{ms}ms"
+                await _wait(page, ms)
+
+            elif action == "screenshot":
+                label = action_data.get("label", f"manual_{step_no}")
+                step_entry["detail"] = label
+                extra = await take_screenshot(page, label, directory=screenshot_dir)
+                step_entry["screenshot"] = extra.name
+                report["screenshots"].append(extra.name)
+
+            elif action == "done":
+                success = bool(action_data.get("success", True))
+                summary = action_data.get("summary", "Task complete.")
+                step_entry["detail"] = summary
+                report["status"] = "success" if success else "failed"
+                report["summary"] = summary
+                _record(step_entry)
+                logger.info("🏁 done (success=%s): %s", success, summary)
+                break
+
+            else:
+                step_entry["error"] = f"Unknown action: {action}"
+                logger.warning("⚠️  Unknown action '%s' — skipping.", action)
+
+        except Exception as exc:
+            logger.error("❌ Action '%s' failed: %s", action, exc)
+            step_entry["error"] = str(exc)
+            last_error = f'action="{action}" failed: {exc}'
+
+        _record(step_entry)
+        await _wait(page, 700)
+
+    else:
+        # Loop finished without a "done" action
+        report["status"] = "incomplete"
+        report["summary"] = (
+            f"Reached the step limit ({max_steps}) before the task was confirmed complete."
+        )
+        logger.warning(report["summary"])
+
+    # Final screenshot for the report
+    final = await take_screenshot(page, "final_state", directory=screenshot_dir)
+    report["screenshots"].append(final.name)
+
+    logger.info("=" * 60)
+    logger.info("Run finished — status: %s", report["status"])
+    logger.info("=" * 60)
+    return report
+
+
+async def execute_task(
+    url: str,
+    instruction: str,
+    headless: bool = True,
+    slow_mo: int = 50,
+    max_steps: int = 15,
+    screenshot_dir: Optional[Path] = None,
+    on_step=None,
+) -> dict:
+    """
+    Open a browser, run the generic instruction agent, and clean up.
+
+    This is the single entry point the web frontend calls. It owns the
+    full browser lifecycle so callers only deal with the resulting report.
+
+    Returns the report dict from :func:`run_instruction_agent`.
+    """
+    playwright = None
+    browser = None
+    try:
+        playwright, browser, page = await open_browser(
+            headless=headless, slow_mo=slow_mo
+        )
+        return await run_instruction_agent(
+            page=page,
+            url=url,
+            instruction=instruction,
+            max_steps=max_steps,
+            screenshot_dir=screenshot_dir,
+            on_step=on_step,
+        )
+    except Exception as exc:
+        logger.exception("Fatal error in execute_task: %s", exc)
+        return {
+            "url": url,
+            "instruction": instruction,
+            "status": "error",
+            "summary": f"Fatal error: {exc}",
+            "model": _get_env("GROQ_MODEL", ""),
+            "steps": [],
+            "extracted": [],
+            "screenshots": [],
+        }
+    finally:
+        if browser:
+            await browser.close()
+        if playwright:
+            await playwright.stop()

@@ -169,14 +169,21 @@ async def navigate_to_url(page: Page, url: str) -> None:
 # Tool 3 — take_screenshot
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def take_screenshot(page: Page, label: str = "screenshot") -> Path:
+async def take_screenshot(
+    page: Page,
+    label: str = "screenshot",
+    directory: Optional[Path] = None,
+) -> Path:
     """
-    Capture a full-page PNG screenshot and save it to the screenshots/ folder.
+    Capture a full-page PNG screenshot and save it to a screenshots folder.
 
     Args:
-        page:  The active Playwright Page instance.
-        label: A descriptive label appended to the file name
-               (e.g., "initial_state", "form_filled").
+        page:      The active Playwright Page instance.
+        label:     A descriptive label appended to the file name
+                   (e.g., "initial_state", "form_filled").
+        directory: Optional output directory. Defaults to the global
+                   screenshots/ folder. The web app uses a per-run
+                   subfolder so each task's screenshots stay grouped.
 
     Returns:
         Path object pointing to the saved screenshot file.
@@ -184,7 +191,9 @@ async def take_screenshot(page: Page, label: str = "screenshot") -> Path:
     Raises:
         Exception: If the screenshot cannot be saved.
     """
-    filename = SCREENSHOT_DIR / f"{_timestamp()}_{label}.png"
+    out_dir = Path(directory) if directory is not None else SCREENSHOT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filename = out_dir / f"{_timestamp()}_{label}.png"
     logger.info("📸 Taking screenshot → %s", filename)
     try:
         await page.screenshot(path=str(filename), full_page=False)
@@ -364,3 +373,162 @@ async def click_element(
     except Exception as exc:
         logger.error("❌ click_element failed for '%s': %s", selector, exc)
         raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bonus Tool — press_key (send keyboard keys, e.g. Enter to submit)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def press_key(page: Page, key: str) -> None:
+    """
+    Press a keyboard key on the currently focused element / page.
+
+    Useful for submitting forms (Enter), dismissing dialogs (Escape),
+    or navigating (Tab) without needing a clickable element.
+
+    Args:
+        page: The active Playwright Page instance.
+        key:  A Playwright key name, e.g. "Enter", "Escape", "Tab".
+
+    Raises:
+        Exception: If the key press cannot be performed.
+    """
+    logger.info("⌨️  Pressing key: '%s'", key)
+    try:
+        await page.keyboard.press(key)
+        logger.debug("✅ Key pressed: '%s'", key)
+    except Exception as exc:
+        logger.error("❌ press_key failed for '%s': %s", key, exc)
+        raise
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bonus Tool — get_text (read visible text, for extracting results into reports)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_text(
+    page: Page,
+    selector: str = "body",
+    timeout: int = DEFAULT_TIMEOUT,
+    max_chars: int = 2000,
+) -> str:
+    """
+    Read the visible inner text of an element identified by a CSS selector.
+
+    This lets the agent "observe" page content (confirmation messages,
+    search results, article text) and include it in the run report.
+
+    Args:
+        page:      The active Playwright Page instance.
+        selector:  CSS selector for the element to read (default "body").
+        timeout:   Max wait time in ms for the element to appear.
+        max_chars: Truncate the returned text to this many characters.
+
+    Returns:
+        The element's inner text (possibly truncated), or "" on failure.
+    """
+    logger.info("👀 Reading text from: '%s'", selector)
+    try:
+        element = page.locator(selector).first
+        await element.wait_for(state="visible", timeout=timeout)
+        text = (await element.inner_text()).strip()
+        if len(text) > max_chars:
+            text = text[:max_chars] + "…"
+        logger.info("✅ Extracted %d chars from '%s'", len(text), selector)
+        return text
+    except Exception as exc:
+        logger.warning("⚠️  get_text failed for '%s': %s", selector, exc)
+        return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bonus Tool — list_interactables (give the agent REAL selectors from the DOM)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# JavaScript that runs in the page to collect visible, interactable elements
+# (inputs, textareas, buttons, links, etc.) together with a robust CSS selector
+# for each. The agent can only see a screenshot, so feeding it the real
+# selectors stops it from guessing attribute names that don't exist.
+_INTERACTABLES_JS = r"""
+(maxItems) => {
+  const out = [];
+  const sel =
+    'input, textarea, select, button, a[href], [role="button"], ' +
+    '[role="searchbox"], [role="textbox"], [contenteditable="true"]';
+  const nodes = Array.from(document.querySelectorAll(sel));
+
+  const cssEsc = (window.CSS && CSS.escape) ? CSS.escape : (s) => s.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+  const q = (v) => String(v).replace(/"/g, '\\"');
+
+  const isVisible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    const st = window.getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') return false;
+    // must be within (or near) the viewport vertically
+    if (r.bottom < 0 || r.top > (window.innerHeight + 1200)) return false;
+    return true;
+  };
+
+  const selectorFor = (el) => {
+    const tag = el.tagName.toLowerCase();
+    if (el.id) return tag + '#' + cssEsc(el.id);
+    if (el.getAttribute('name')) return tag + '[name="' + q(el.getAttribute('name')) + '"]';
+    const ph = el.getAttribute('placeholder');
+    if (ph) return tag + '[placeholder="' + q(ph) + '"]';
+    const al = el.getAttribute('aria-label');
+    if (al) return tag + '[aria-label="' + q(al) + '"]';
+    const tp = el.getAttribute('type');
+    if (tp) return tag + '[type="' + q(tp) + '"]';
+    return tag;
+  };
+
+  const labelFor = (el) => {
+    return (
+      el.getAttribute('aria-label') ||
+      el.getAttribute('placeholder') ||
+      el.getAttribute('name') ||
+      el.getAttribute('value') ||
+      (el.innerText || '').trim() ||
+      el.getAttribute('title') ||
+      ''
+    ).replace(/\s+/g, ' ').slice(0, 60);
+  };
+
+  for (const el of nodes) {
+    if (!isVisible(el)) continue;
+    out.push({
+      tag: el.tagName.toLowerCase(),
+      type: el.getAttribute('type') || '',
+      label: labelFor(el),
+      selector: selectorFor(el),
+    });
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+"""
+
+
+async def list_interactables(page: Page, max_items: int = 30) -> list:
+    """
+    Return a list of visible, interactable elements with real CSS selectors.
+
+    Each item is a dict: {"tag", "type", "label", "selector"}. The agent uses
+    this so it targets selectors that actually exist on the page instead of
+    guessing attribute names from a screenshot.
+
+    Args:
+        page:      The active Playwright Page instance.
+        max_items: Cap on how many elements to return (keeps the prompt small).
+
+    Returns:
+        A list of element descriptor dicts (possibly empty on failure).
+    """
+    try:
+        items = await page.evaluate(_INTERACTABLES_JS, max_items)
+        logger.info("🧭 Found %d interactable element(s)", len(items))
+        return items
+    except Exception as exc:
+        logger.warning("⚠️  list_interactables failed: %s", exc)
+        return []

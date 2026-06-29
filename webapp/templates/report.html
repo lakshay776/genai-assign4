@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Report · {{ run.id }}</title>
+  <style>
+    :root {
+      --bg: #0f172a; --card: #1e293b; --muted: #94a3b8; --text: #e2e8f0;
+      --accent: #6366f1; --border: #334155;
+      --ok: #22c55e; --warn: #f59e0b; --err: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: radial-gradient(1200px 600px at 80% -10%, #1e1b4b 0%, var(--bg) 55%);
+      color: var(--text); min-height: 100vh;
+    }
+    .wrap { max-width: 920px; margin: 0 auto; padding: 32px 20px 80px; }
+    a.back { color: var(--muted); text-decoration: none; font-size: 14px; }
+    a.back:hover { color: var(--text); }
+    .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
+            margin: 16px 0 8px; }
+    .head h1 { font-size: 22px; margin: 0; }
+    .meta { color: var(--muted); font-size: 13px; word-break: break-all; }
+    .meta a { color: #a5b4fc; }
+    .pill { font-size: 12px; font-weight: 700; padding: 5px 12px; border-radius: 999px;
+            text-transform: uppercase; white-space: nowrap; }
+    .s-running { background: rgba(99,102,241,.18); color: #c7d2fe; }
+    .s-success { background: rgba(34,197,94,.15); color: var(--ok); }
+    .s-failed, .s-error { background: rgba(239,68,68,.15); color: var(--err); }
+    .s-incomplete { background: rgba(245,158,11,.15); color: var(--warn); }
+    .summary { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+               padding: 16px 18px; margin: 18px 0; }
+    .summary .lbl { font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: .04em; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+    .step { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+            overflow: hidden; display: flex; gap: 0; }
+    .step .left { flex: 1; padding: 16px 18px; min-width: 0; }
+    .step .num { display: inline-block; min-width: 26px; height: 26px; line-height: 26px;
+                 text-align: center; border-radius: 8px; background: #0b1220; color: #c7d2fe;
+                 font-size: 13px; font-weight: 700; margin-right: 8px; }
+    .act { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+           color: #a5b4fc; font-weight: 600; }
+    .thought { color: var(--text); margin: 8px 0 4px; font-size: 14px; }
+    .detail { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace;
+              word-break: break-all; }
+    .obs { margin-top: 8px; background: #0b1220; border: 1px solid var(--border); border-radius: 8px;
+           padding: 8px 10px; font-size: 12px; color: #cbd5e1; white-space: pre-wrap; max-height: 160px;
+           overflow: auto; }
+    .err-line { color: #fecaca; font-size: 12px; margin-top: 8px; }
+    .shot { width: 240px; flex-shrink: 0; border-left: 1px solid var(--border); background: #0b1220; }
+    .shot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .extracted { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+                 padding: 16px 18px; margin-top: 18px; }
+    .extracted pre { white-space: pre-wrap; font-size: 13px; color: #cbd5e1; margin: 6px 0 0; }
+    .loader { display: inline-block; width: 12px; height: 12px; border: 2px solid #c7d2fe;
+              border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite;
+              vertical-align: middle; margin-right: 6px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .empty { color: var(--muted); text-align: center; padding: 30px; }
+    @media (max-width: 640px) { .step { flex-direction: column; } .shot { width: 100%; border-left: none; border-top: 1px solid var(--border); } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <a class="back" href="{{ url_for('index') }}">← New run</a>
+
+    <div class="head">
+      <div>
+        <h1>Automation Report</h1>
+        <div class="meta">
+          <a href="{{ run.url }}" target="_blank" rel="noopener">{{ run.url }}</a><br>
+          <strong>Task:</strong> {{ run.instruction }}<br>
+          <span>Started {{ run.started_at }}{% if run.model %} · model {{ run.model }}{% endif %}</span>
+        </div>
+      </div>
+      <span id="statusPill" class="pill s-{{ run.status }}">{{ run.status }}</span>
+    </div>
+
+    <div class="summary">
+      <div class="lbl">Summary</div>
+      <div id="summary">
+        {% if run.summary %}{{ run.summary }}
+        {% elif run.status == 'running' %}<span class="loader"></span> Agent is working…
+        {% else %}—{% endif %}
+      </div>
+    </div>
+
+    <div class="grid" id="steps"></div>
+    <div id="extractedBox"></div>
+  </div>
+
+  <script>
+    var RUN_ID = {{ run.id | tojson }};
+    var SHOT_BASE = "{{ url_for('shot', run_id=run.id, filename='__F__') }}";
+
+    function shotUrl(name) { return SHOT_BASE.replace('__F__', encodeURIComponent(name)); }
+    function esc(s) {
+      return (s == null ? '' : String(s))
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function renderSteps(steps) {
+      var box = document.getElementById('steps');
+      if (!steps.length) {
+        box.innerHTML = '<div class="empty">Waiting for the first step…</div>';
+        return;
+      }
+      box.innerHTML = steps.map(function (s) {
+        var shot = s.screenshot
+          ? '<div class="shot"><a href="' + shotUrl(s.screenshot) + '" target="_blank">' +
+            '<img src="' + shotUrl(s.screenshot) + '" alt="step ' + s.step + '"></a></div>'
+          : '';
+        var obs = s.observation
+          ? '<div class="obs">' + esc(s.observation) + '</div>' : '';
+        var err = s.error
+          ? '<div class="err-line">⚠ ' + esc(s.error) + '</div>' : '';
+        var detail = s.detail
+          ? '<div class="detail">' + esc(s.detail) + '</div>' : '';
+        var thought = s.thought
+          ? '<div class="thought">' + esc(s.thought) + '</div>' : '';
+        return '<div class="step"><div class="left">' +
+          '<span class="num">' + s.step + '</span>' +
+          '<span class="act">' + esc(s.action) + '</span>' +
+          thought + detail + obs + err +
+          '</div>' + shot + '</div>';
+      }).join('');
+    }
+
+    function renderExtracted(items) {
+      var box = document.getElementById('extractedBox');
+      if (!items || !items.length) { box.innerHTML = ''; return; }
+      box.innerHTML = '<div class="extracted"><div class="lbl" style="font-size:12px;' +
+        'text-transform:uppercase;color:#94a3b8;letter-spacing:.04em">Extracted text</div>' +
+        items.map(function (t) { return '<pre>' + esc(t) + '</pre>'; }).join('') + '</div>';
+    }
+
+    function applyStatus(st) {
+      var pill = document.getElementById('statusPill');
+      pill.className = 'pill s-' + st;
+      pill.textContent = st;
+    }
+
+    function poll() {
+      fetch('{{ url_for("status", run_id=run.id) }}')
+        .then(function (r) { return r.json(); })
+        .then(function (run) {
+          applyStatus(run.status);
+          renderSteps(run.steps || []);
+          renderExtracted(run.extracted || []);
+          var sum = document.getElementById('summary');
+          if (run.summary) sum.textContent = run.summary;
+          else if (run.status === 'running')
+            sum.innerHTML = '<span class="loader"></span> Agent is working…';
+          if (run.status === 'running') {
+            setTimeout(poll, 1500);
+          }
+        })
+        .catch(function () { setTimeout(poll, 2500); });
+    }
+    poll();
+  </script>
+</body>
+</html>
